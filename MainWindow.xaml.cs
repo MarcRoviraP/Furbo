@@ -24,6 +24,7 @@ namespace Furbo
         private HttpListener listener;
         private Thread listenerThread;
         private bool isInitialized = false;
+        private bool isWebViewLoaded = false;
         private int currentPort = 0;
         private readonly System.Threading.SemaphoreSlim navigationLock = new System.Threading.SemaphoreSlim(1, 1);
         ArrayList ids = new ArrayList();
@@ -57,27 +58,16 @@ namespace Furbo
                 if (!e.IsSuccess) return;
                 string script = $@"
 (function() {{
-    var matchId = ""{ids[0]}"";
-    var elementoOriginal = document.getElementById(matchId);
+    // Obtener todos los IDs de partidos
+    var matchIds = [{string.Join(", ", ids.Cast<string>().Select(id => $"\"{id}\""))}];
     
-    if (!elementoOriginal) {{
-        console.error(""Partido no encontrado: "" + matchId);
-        return;
+    // Eliminar overlay anterior si existe
+    var oldOverlay = document.getElementById(""mi-overlay"");
+    if (oldOverlay) {{
+        oldOverlay.remove();
     }}
-
-    // Obtener el contenedor de la liga
-    var ligaOriginal = elementoOriginal.closest("".headerLeague__wrapper, section"") 
-                      || elementoOriginal.parentElement.parentElement;
     
-    // CLONAR el contenedor
-    var ligaClon = ligaOriginal.cloneNode(true);
-    
-    // Limpiar otros partidos del clon
-    ligaClon.querySelectorAll('[id^=""g_1_""]').forEach(function(p) {{
-        if (p.id !== matchId) p.remove();
-    }});
-
-    // Crear overlay
+    // Crear nuevo overlay
     var overlay = document.createElement(""div"");
     overlay.id = ""mi-overlay"";
     overlay.style.cssText =
@@ -88,8 +78,79 @@ namespace Furbo
         ""z-index: 999999;"" +
         ""overflow: auto;"" +
         ""padding: 20px;"";
+    
+    // Contenedor para todos los partidos
+    var container = document.createElement(""div"");
+    container.style.cssText = ""display: flex; flex-direction: column; gap: 20px;"";
+    
+    // Procesar cada partido
+    matchIds.forEach(function(matchId) {{
+        var elementoOriginal = document.getElementById(matchId);
+        
+        if (!elementoOriginal) {{
+            console.error(""Partido no encontrado: "" + matchId);
+            return;
+        }}
 
-    overlay.appendChild(ligaClon);
+        // Obtener el contenedor de la liga
+        var ligaOriginal = elementoOriginal.closest("".headerLeague__wrapper, section"") 
+                          || elementoOriginal.parentElement.parentElement;
+        
+        // CLONAR el contenedor
+        var ligaClon = ligaOriginal.cloneNode(true);
+        
+        // Limpiar otros partidos del clon
+        ligaClon.querySelectorAll('[id^=""g_1_""]').forEach(function(p) {{
+            if (p.id !== matchId) p.remove();
+        }});
+
+        container.appendChild(ligaClon);
+
+        // SINCRONIZAR: Observar cambios en el elemento ORIGINAL y copiarlos al CLON
+        var elementoClon = ligaClon.querySelector('#' + matchId);
+        
+        var syncObserver = new MutationObserver(function(mutations) {{
+            mutations.forEach(function(mutation) {{
+                // Copiar cambios de atributos
+                if (mutation.type === 'attributes') {{
+                    var attrName = mutation.attributeName;
+                    var newValue = elementoOriginal.getAttribute(attrName);
+                    if (elementoClon.getAttribute(attrName) !== newValue) {{
+                        if (newValue === null) {{
+                            elementoClon.removeAttribute(attrName);
+                        }} else {{
+                            elementoClon.setAttribute(attrName, newValue);
+                        }}
+                    }}
+                }}
+                
+                // Copiar cambios en el contenido (texto, HTML interno)
+                if (mutation.type === 'childList' || mutation.type === 'characterData') {{
+                    elementoClon.innerHTML = elementoOriginal.innerHTML;
+                }}
+            }});
+        }});
+
+        // Observar TODO en el elemento original
+        syncObserver.observe(elementoOriginal, {{
+            attributes: true,
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributeOldValue: true
+        }});
+
+        // También sincronizar cambios en subelementos específicos (marcadores, tiempo, etc.)
+        var deepSyncObserver = new MutationObserver(function() {{
+            elementoClon.innerHTML = elementoOriginal.innerHTML;
+        }});
+
+        deepSyncObserver.observe(elementoOriginal, {{
+            childList: true,
+            subtree: true,
+            characterData: true
+        }});
+    }});
 
     // Ocultar el resto del contenido
     document.body.childNodes.forEach(function(nodo) {{
@@ -98,59 +159,16 @@ namespace Furbo
             nodo.setAttribute(""data-oculto"", ""true"");
         }}
     }});
-
+    
+    overlay.appendChild(container);
     document.body.appendChild(overlay);
 
-    // SINCRONIZAR: Observar cambios en el elemento ORIGINAL y copiarlos al CLON
-    var elementoClon = ligaClon.querySelector('#' + matchId);
-    
-    var syncObserver = new MutationObserver(function(mutations) {{
-        mutations.forEach(function(mutation) {{
-            // Copiar cambios de atributos
-            if (mutation.type === 'attributes') {{
-                var attrName = mutation.attributeName;
-                var newValue = elementoOriginal.getAttribute(attrName);
-                if (elementoClon.getAttribute(attrName) !== newValue) {{
-                    if (newValue === null) {{
-                        elementoClon.removeAttribute(attrName);
-                    }} else {{
-                        elementoClon.setAttribute(attrName, newValue);
-                    }}
-                }}
-            }}
-            
-            // Copiar cambios en el contenido (texto, HTML interno)
-            if (mutation.type === 'childList' || mutation.type === 'characterData') {{
-                elementoClon.innerHTML = elementoOriginal.innerHTML;
-            }}
-        }});
-    }});
-
-    // Observar TODO en el elemento original
-    syncObserver.observe(elementoOriginal, {{
-        attributes: true,
-        childList: true,
-        subtree: true,
-        characterData: true,
-        attributeOldValue: true
-    }});
-
-    // También sincronizar cambios en subelementos específicos (marcadores, tiempo, etc.)
-    var deepSyncObserver = new MutationObserver(function() {{
-        elementoClon.innerHTML = elementoOriginal.innerHTML;
-    }});
-
-    deepSyncObserver.observe(elementoOriginal, {{
-        childList: true,
-        subtree: true,
-        characterData: true
-    }});
-
-    console.log(""✓ Furbo: Partido "" + matchId + "" sincronizado en tiempo real"");
+    console.log(""✓ Furbo: "" + matchIds.length + "" partido(s) sincronizado(s) en tiempo real"");
 }})();
 ";
 
                 await webView.CoreWebView2.ExecuteScriptAsync(script);
+                webView.Visibility = Visibility.Visible;
             };
             webView.CoreWebView2.Navigate("https://flashscore.es");
         }
@@ -197,11 +215,20 @@ namespace Furbo
                                                 var jsonDoc = System.Text.Json.JsonDocument.Parse(body);
                                                 var root = jsonDoc.RootElement;
 
-                                                if (root.TryGetProperty("id", out var idValido))
+                                if (root.TryGetProperty("id", out var idValido))
                                                 {
                                                     id = idValido.ToString();
-                                                    ids.Add(id);
-                                                    Console.WriteLine($"[Http] ✓ ID: {id}");
+                                                    
+                                                    // Verificar si el ID ya existe (evitar duplicados)
+                                                    if (!ids.Contains(id))
+                                                    {
+                                                        ids.Add(id);
+                                                        Console.WriteLine($"[Http] ✓ ID añadido: {id} (Total: {ids.Count})");
+                                                    }
+                                                    else
+                                                    {
+                                                        Console.WriteLine($"[Http] ⚠ ID duplicado ignorado: {id}");
+                                                    }
                                                 }
                                             }
                                             catch (Exception ex)
@@ -219,7 +246,131 @@ namespace Furbo
                                         await navigationLock.WaitAsync();
                                         try
                                         {
-                                            setupWebView2();
+                                            // Si el WebView ya está cargado, solo ejecutar el script
+                                            if (isWebViewLoaded)
+                                            {
+                                                System.Diagnostics.Debug.WriteLine("[App] → Actualizando partidos sin recargar...");
+                                                
+                                                // Ejecutar el script directamente sin recargar
+                                                string script = $@"
+(function() {{
+    // Obtener todos los IDs de partidos
+    var matchIds = [{string.Join(", ", ids.Cast<string>().Select(id => $"\"{id}\""))}];
+    
+    // Eliminar overlay anterior si existe
+    var oldOverlay = document.getElementById(""mi-overlay"");
+    if (oldOverlay) {{
+        oldOverlay.remove();
+    }}
+    
+    // Crear nuevo overlay
+    var overlay = document.createElement(""div"");
+    overlay.id = ""mi-overlay"";
+    overlay.style.cssText =
+        ""position: fixed;"" +
+        ""top: 0; left: 0;"" +
+        ""width: 100vw; height: 100vh;"" +
+        ""background: #001e28;"" +
+        ""z-index: 999999;"" +
+        ""overflow: auto;"" +
+        ""padding: 20px;"";
+    
+    // Contenedor para todos los partidos
+    var container = document.createElement(""div"");
+    container.style.cssText = ""display: flex; flex-direction: column; gap: 20px;"";
+    
+    // Procesar cada partido
+    matchIds.forEach(function(matchId) {{
+        var elementoOriginal = document.getElementById(matchId);
+        
+        if (!elementoOriginal) {{
+            console.error(""Partido no encontrado: "" + matchId);
+            return;
+        }}
+
+        // Obtener el contenedor de la liga
+        var ligaOriginal = elementoOriginal.closest("".headerLeague__wrapper, section"") 
+                          || elementoOriginal.parentElement.parentElement;
+        
+        // CLONAR el contenedor
+        var ligaClon = ligaOriginal.cloneNode(true);
+        
+        // Limpiar otros partidos del clon
+        ligaClon.querySelectorAll('[id^=""g_1_""]').forEach(function(p) {{
+            if (p.id !== matchId) p.remove();
+        }});
+
+        container.appendChild(ligaClon);
+
+        // SINCRONIZAR: Observar cambios en el elemento ORIGINAL y copiarlos al CLON
+        var elementoClon = ligaClon.querySelector('#' + matchId);
+        
+        var syncObserver = new MutationObserver(function(mutations) {{
+            mutations.forEach(function(mutation) {{
+                // Copiar cambios de atributos
+                if (mutation.type === 'attributes') {{
+                    var attrName = mutation.attributeName;
+                    var newValue = elementoOriginal.getAttribute(attrName);
+                    if (elementoClon.getAttribute(attrName) !== newValue) {{
+                        if (newValue === null) {{
+                            elementoClon.removeAttribute(attrName);
+                        }} else {{
+                            elementoClon.setAttribute(attrName, newValue);
+                        }}
+                    }}
+                }}
+                
+                // Copiar cambios en el contenido (texto, HTML interno)
+                if (mutation.type === 'childList' || mutation.type === 'characterData') {{
+                    elementoClon.innerHTML = elementoOriginal.innerHTML;
+                }}
+            }});
+        }});
+
+        // Observar TODO en el elemento original
+        syncObserver.observe(elementoOriginal, {{
+            attributes: true,
+            childList: true,
+            subtree: true,
+            characterData: true,
+            attributeOldValue: true
+        }});
+
+        // También sincronizar cambios en subelementos específicos (marcadores, tiempo, etc.)
+        var deepSyncObserver = new MutationObserver(function() {{
+            elementoClon.innerHTML = elementoOriginal.innerHTML;
+        }});
+
+        deepSyncObserver.observe(elementoOriginal, {{
+            childList: true,
+            subtree: true,
+            characterData: true
+        }});
+    }});
+
+    // Ocultar el resto del contenido
+    document.body.childNodes.forEach(function(nodo) {{
+        if (nodo.nodeType === 1 && nodo.id !== ""mi-overlay"") {{
+            nodo.style.display = ""none"";
+            nodo.setAttribute(""data-oculto"", ""true"");
+        }}
+    }});
+    
+    overlay.appendChild(container);
+    document.body.appendChild(overlay);
+
+    console.log(""✓ Furbo: "" + matchIds.length + "" partido(s) sincronizado(s) en tiempo real"");
+}})();
+";
+                                                await webView.CoreWebView2.ExecuteScriptAsync(script);
+                                            }
+                                            else
+                                            {
+                                                // Primera vez: inicializar WebView y cargar Flashscore
+                                                setupWebView2();
+                                                isWebViewLoaded = true;
+                                            }
+                                            
                                             System.Diagnostics.Debug.WriteLine("[App] → Mostrando ventana...");
 
                                             this.Visibility = Visibility.Visible;
