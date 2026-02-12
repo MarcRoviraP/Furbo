@@ -1,11 +1,9 @@
 ﻿using System.Collections;
-using System.ComponentModel;
+using System.Diagnostics;
 using System.Drawing;
 using System.Net;
 using System.Text;
 using System.Windows;
-using System.Windows.Input;
-using Microsoft.Web.WebView2.Wpf;
 
 namespace Furbo
 {
@@ -48,6 +46,7 @@ namespace Furbo
             webView.CoreWebView2.Settings.IsScriptEnabled = true;
 
         }
+        private bool isPageReady = false;
 
         private async void setupWebView2()
         {
@@ -56,120 +55,12 @@ namespace Furbo
             webView.CoreWebView2.NavigationCompleted += async (s, e) =>
             {
                 if (!e.IsSuccess) return;
-                string script = $@"
-(function() {{
-    // Obtener todos los IDs de partidos
-    var matchIds = [{string.Join(", ", ids.Cast<string>().Select(id => $"\"{id}\""))}];
-    
-    // Eliminar overlay anterior si existe
-    var oldOverlay = document.getElementById(""mi-overlay"");
-    if (oldOverlay) {{
-        oldOverlay.remove();
-    }}
-    
-    // Crear nuevo overlay
-    var overlay = document.createElement(""div"");
-    overlay.id = ""mi-overlay"";
-    overlay.style.cssText =
-        ""position: fixed;"" +
-        ""top: 0; left: 0;"" +
-        ""width: 100vw; height: 100vh;"" +
-        ""background: #001e28;"" +
-        ""z-index: 999999;"" +
-        ""overflow: auto;"" +
-        ""padding: 20px;"";
-    
-    // Contenedor para todos los partidos
-    var container = document.createElement(""div"");
-    container.style.cssText = ""display: flex; flex-direction: column; gap: 20px;"";
-    
-    // Procesar cada partido
-    matchIds.forEach(function(matchId) {{
-        var elementoOriginal = document.getElementById(matchId);
-        
-        if (!elementoOriginal) {{
-            console.error(""Partido no encontrado: "" + matchId);
-            return;
-        }}
 
-        // Obtener el contenedor de la liga
-        var ligaOriginal = elementoOriginal.closest("".headerLeague__wrapper, section"") 
-                          || elementoOriginal.parentElement.parentElement;
-        
-        // CLONAR el contenedor
-        var ligaClon = ligaOriginal.cloneNode(true);
-        
-        // Limpiar otros partidos del clon
-        ligaClon.querySelectorAll('[id^=""g_1_""]').forEach(function(p) {{
-            if (p.id !== matchId) p.remove();
-        }});
-
-        container.appendChild(ligaClon);
-
-        // SINCRONIZAR: Observar cambios en el elemento ORIGINAL y copiarlos al CLON
-        var elementoClon = ligaClon.querySelector('#' + matchId);
-        
-        var syncObserver = new MutationObserver(function(mutations) {{
-            mutations.forEach(function(mutation) {{
-                // Copiar cambios de atributos
-                if (mutation.type === 'attributes') {{
-                    var attrName = mutation.attributeName;
-                    var newValue = elementoOriginal.getAttribute(attrName);
-                    if (elementoClon.getAttribute(attrName) !== newValue) {{
-                        if (newValue === null) {{
-                            elementoClon.removeAttribute(attrName);
-                        }} else {{
-                            elementoClon.setAttribute(attrName, newValue);
-                        }}
-                    }}
-                }}
-                
-                // Copiar cambios en el contenido (texto, HTML interno)
-                if (mutation.type === 'childList' || mutation.type === 'characterData') {{
-                    elementoClon.innerHTML = elementoOriginal.innerHTML;
-                }}
-            }});
-        }});
-
-        // Observar TODO en el elemento original
-        syncObserver.observe(elementoOriginal, {{
-            attributes: true,
-            childList: true,
-            subtree: true,
-            characterData: true,
-            attributeOldValue: true
-        }});
-
-        // También sincronizar cambios en subelementos específicos (marcadores, tiempo, etc.)
-        var deepSyncObserver = new MutationObserver(function() {{
-            elementoClon.innerHTML = elementoOriginal.innerHTML;
-        }});
-
-        deepSyncObserver.observe(elementoOriginal, {{
-            childList: true,
-            subtree: true,
-            characterData: true
-        }});
-    }});
-
-    // Ocultar el resto del contenido
-    document.body.childNodes.forEach(function(nodo) {{
-        if (nodo.nodeType === 1 && nodo.id !== ""mi-overlay"") {{
-            nodo.style.display = ""none"";
-            nodo.setAttribute(""data-oculto"", ""true"");
-        }}
-    }});
-    
-    overlay.appendChild(container);
-    document.body.appendChild(overlay);
-
-    console.log(""✓ Furbo: "" + matchIds.length + "" partido(s) sincronizado(s) en tiempo real"");
-}})();
-";
-
-                await webView.CoreWebView2.ExecuteScriptAsync(script);
+                isPageReady = true;  // ← ahora sí está lista
+                await ejecutarScript();
                 webView.Visibility = Visibility.Visible;
             };
+
             webView.CoreWebView2.Navigate("https://flashscore.es");
         }
 
@@ -223,11 +114,11 @@ namespace Furbo
                                                     if (!ids.Contains(id))
                                                     {
                                                         ids.Add(id);
-                                                        Console.WriteLine($"[Http] ✓ ID añadido: {id} (Total: {ids.Count})");
+                                                        Debug.WriteLine($"[Http] ✓ ID añadido: {id} (Total: {ids.Count})");
                                                     }
                                                     else
                                                     {
-                                                        Console.WriteLine($"[Http] ⚠ ID duplicado ignorado: {id}");
+                                                        Debug.WriteLine($"[Http] ⚠ ID duplicado ignorado: {id}");
                                                     }
                                                 }
                                             }
@@ -247,130 +138,19 @@ namespace Furbo
                                         try
                                         {
                                             // Si el WebView ya está cargado, solo ejecutar el script
-                                            if (isWebViewLoaded)
+                                            if (isWebViewLoaded && isPageReady)
                                             {
-                                                System.Diagnostics.Debug.WriteLine("[App] → Actualizando partidos sin recargar...");
-                                                
-                                                // Ejecutar el script directamente sin recargar
-                                                string script = $@"
-(function() {{
-    // Obtener todos los IDs de partidos
-    var matchIds = [{string.Join(", ", ids.Cast<string>().Select(id => $"\"{id}\""))}];
-    
-    // Eliminar overlay anterior si existe
-    var oldOverlay = document.getElementById(""mi-overlay"");
-    if (oldOverlay) {{
-        oldOverlay.remove();
-    }}
-    
-    // Crear nuevo overlay
-    var overlay = document.createElement(""div"");
-    overlay.id = ""mi-overlay"";
-    overlay.style.cssText =
-        ""position: fixed;"" +
-        ""top: 0; left: 0;"" +
-        ""width: 100vw; height: 100vh;"" +
-        ""background: #001e28;"" +
-        ""z-index: 999999;"" +
-        ""overflow: auto;"" +
-        ""padding: 20px;"";
-    
-    // Contenedor para todos los partidos
-    var container = document.createElement(""div"");
-    container.style.cssText = ""display: flex; flex-direction: column; gap: 20px;"";
-    
-    // Procesar cada partido
-    matchIds.forEach(function(matchId) {{
-        var elementoOriginal = document.getElementById(matchId);
-        
-        if (!elementoOriginal) {{
-            console.error(""Partido no encontrado: "" + matchId);
-            return;
-        }}
-
-        // Obtener el contenedor de la liga
-        var ligaOriginal = elementoOriginal.closest("".headerLeague__wrapper, section"") 
-                          || elementoOriginal.parentElement.parentElement;
-        
-        // CLONAR el contenedor
-        var ligaClon = ligaOriginal.cloneNode(true);
-        
-        // Limpiar otros partidos del clon
-        ligaClon.querySelectorAll('[id^=""g_1_""]').forEach(function(p) {{
-            if (p.id !== matchId) p.remove();
-        }});
-
-        container.appendChild(ligaClon);
-
-        // SINCRONIZAR: Observar cambios en el elemento ORIGINAL y copiarlos al CLON
-        var elementoClon = ligaClon.querySelector('#' + matchId);
-        
-        var syncObserver = new MutationObserver(function(mutations) {{
-            mutations.forEach(function(mutation) {{
-                // Copiar cambios de atributos
-                if (mutation.type === 'attributes') {{
-                    var attrName = mutation.attributeName;
-                    var newValue = elementoOriginal.getAttribute(attrName);
-                    if (elementoClon.getAttribute(attrName) !== newValue) {{
-                        if (newValue === null) {{
-                            elementoClon.removeAttribute(attrName);
-                        }} else {{
-                            elementoClon.setAttribute(attrName, newValue);
-                        }}
-                    }}
-                }}
-                
-                // Copiar cambios en el contenido (texto, HTML interno)
-                if (mutation.type === 'childList' || mutation.type === 'characterData') {{
-                    elementoClon.innerHTML = elementoOriginal.innerHTML;
-                }}
-            }});
-        }});
-
-        // Observar TODO en el elemento original
-        syncObserver.observe(elementoOriginal, {{
-            attributes: true,
-            childList: true,
-            subtree: true,
-            characterData: true,
-            attributeOldValue: true
-        }});
-
-        // También sincronizar cambios en subelementos específicos (marcadores, tiempo, etc.)
-        var deepSyncObserver = new MutationObserver(function() {{
-            elementoClon.innerHTML = elementoOriginal.innerHTML;
-        }});
-
-        deepSyncObserver.observe(elementoOriginal, {{
-            childList: true,
-            subtree: true,
-            characterData: true
-        }});
-    }});
-
-    // Ocultar el resto del contenido
-    document.body.childNodes.forEach(function(nodo) {{
-        if (nodo.nodeType === 1 && nodo.id !== ""mi-overlay"") {{
-            nodo.style.display = ""none"";
-            nodo.setAttribute(""data-oculto"", ""true"");
-        }}
-    }});
-    
-    overlay.appendChild(container);
-    document.body.appendChild(overlay);
-
-    console.log(""✓ Furbo: "" + matchIds.length + "" partido(s) sincronizado(s) en tiempo real"");
-}})();
-";
-                                                await webView.CoreWebView2.ExecuteScriptAsync(script);
+                                                // Página ya cargada, ejecutar script directamente
+                                                await ejecutarScript();
                                             }
-                                            else
+                                            else if (!isWebViewLoaded)
                                             {
-                                                // Primera vez: inicializar WebView y cargar Flashscore
-                                                setupWebView2();
+                                                // Primera vez: inicializar y cargar
                                                 isWebViewLoaded = true;
+                                                setupWebView2();
+                                                // No ejecutar script aquí, lo hará NavigationCompleted cuando termine
                                             }
-                                            
+
                                             System.Diagnostics.Debug.WriteLine("[App] → Mostrando ventana...");
 
                                             this.Visibility = Visibility.Visible;
@@ -423,7 +203,68 @@ namespace Furbo
                 }
             }
 
-        
+        private async Task ejecutarScript()
+        {
+            string idsArray = string.Join(", ", ids.Cast<string>().Select(id => $"\"{id}\""));
+
+            string script = $@"
+(function() {{
+    const ids = [{idsArray}];
+
+    // Ocultar todo
+    const all = document.querySelectorAll('body *');
+    all.forEach(el => {{ el.style.display = 'none'; }});
+
+    function showElementAndParents(id) {{
+        const element = document.getElementById(id);
+        if (!element) return false;
+
+        let current = element;
+        while (current) {{
+            current.style.display = '';
+            current = current.parentElement;
+        }}
+
+        element.querySelectorAll('*').forEach(child => {{
+            child.style.display = '';
+        }});
+
+        return true;
+    }}
+
+    function waitAndShow(id, attempts) {{
+        if (attempts <= 0) {{
+            console.warn('Elemento no encontrado tras esperar: ' + id);
+            return;
+        }}
+        if (!showElementAndParents(id)) {{
+            setTimeout(() => waitAndShow(id, attempts - 1), 300);
+        }} else {{
+            console.log('Elemento mostrado: ' + id);
+        }}
+    }}
+
+    ids.forEach(id => waitAndShow(id, 20));
+}})();
+";
+
+            await webView.CoreWebView2.ExecuteScriptAsync(script)
+                .ContinueWith(t =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        Debug.WriteLine($"Error al ejecutar script: {t.Exception?.GetBaseException().Message}");
+                    }
+                    else
+                    {
+                        Debug.WriteLine("Script ejecutado correctamente");
+                        Debug.WriteLine($"Resultado: {t.Result}");
+                    }
+                });
+
+            Debug.WriteLine("Script ejecutado");
+        }
+
 
         private void BringToForeground()
         {
