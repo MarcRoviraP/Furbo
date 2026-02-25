@@ -614,8 +614,6 @@ namespace FlashscoreOverlay
                 using (var headerBrush = new SolidBrush(BgHeader))
                     g.FillRectangle(headerBrush, headerRect);
 
-                // Star icon
-                g.DrawString("☆", _fontStar, new SolidBrush(TextWhite), PADDING_H, y + 6);
 
                 // League text
                 var firstMatch = group.First();
@@ -625,8 +623,6 @@ namespace FlashscoreOverlay
                 var leagueTextRect = new RectangleF(leagueX, y + 7, this.Width - leagueX - 30, HEADER_HEIGHT - 8);
                 g.DrawString(leagueText, _fontHeader, new SolidBrush(TextHeader), leagueTextRect, headerSf);
 
-                // Pin icon
-                g.DrawString("📌", _fontStar, new SolidBrush(Color.FromArgb(7, 135, 250)), this.Width - 28, y + 6);
 
                 // Border bottom
                 using var borderPen = new Pen(BorderColor, 1);
@@ -654,18 +650,18 @@ namespace FlashscoreOverlay
 
                     int cx = PADDING_H;
 
-                    // Col 1: Star (centered vertically)
-                    g.DrawString("☆", _fontStar, new SolidBrush(TextWhite), cx, y + MATCH_ROW_HEIGHT / 2 - 10);
-                    cx += STAR_COL_W;
-
                     // Col 2: Time/Status
                     Color timeColor = isLive ? TextLive : TextWhite;
                     Font timeFont = isLive ? _fontTimeLive : _fontTime;
                     string timeText = match.MatchTime;
+                    Console.WriteLine($"[MARC] match = {match.MatchTime}");    
 
                     if (isLive && timeText.Any(char.IsDigit) && !timeText.Contains(':'))
                     {
                         // Draw minute + blinking apostrophe
+                        timeText = timeText.Replace("'","").Split(" ")[2];
+                        Console.WriteLine($"[MARC] timeText = {timeText}");
+
                         var timeSize = g.MeasureString(timeText, timeFont);
                         float timeY = y + MATCH_ROW_HEIGHT / 2 - timeSize.Height / 2;
                         g.DrawString(timeText, timeFont, new SolidBrush(timeColor), cx, timeY);
@@ -677,6 +673,19 @@ namespace FlashscoreOverlay
                     }
                     else
                     {
+                        string tmp = "";
+                        try
+                        {
+                            tmp = timeText.Split(' ')[1];
+                        }
+                        catch
+                        {
+                            tmp = timeText;
+                        }
+                        finally
+                        {
+                            timeText = tmp;
+                        }
                         var sf = new StringFormat { LineAlignment = StringAlignment.Center };
                         var timeRect = new RectangleF(cx, y, TIME_COL_W, MATCH_ROW_HEIGHT);
                         g.DrawString(timeText, timeFont, new SolidBrush(timeColor), timeRect, sf);
