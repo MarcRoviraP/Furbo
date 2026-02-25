@@ -1,22 +1,41 @@
 ﻿using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Net;
+using System.Linq;
+using System.Net.Http;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Input;
 using System.Windows.Interop;
 using Microsoft.Web.WebView2.Core;
+using WebSocketSharp;
+using WebSocketSharp.Server;
+using AngleSharp;
+using AngleSharp.Dom;
 
 namespace FlashscoreOverlay
 {
+    public class FlashscoreBehavior : WebSocketBehavior
+    {
+        protected override void OnMessage(MessageEventArgs e)
+        {
+            MainWindow.Instance?.HandleWebSocketMessage(e.Data);
+        }
+    }
+
     public partial class MainWindow : Window
     {
-        private HttpListener _httpListener;
-        private const string LocalServerUrl = "http://localhost:19000/";
+        public static MainWindow Instance { get; private set; }
+        private WebSocketServer _wssv;
+        private Timer _scrapeTimer;
+        private static readonly HttpClient _httpClient = new HttpClient();
+        private ConcurrentDictionary<string, string> _trackedMatches = new ConcurrentDictionary<string, string>();
         private bool _isWebViewReady = false;
         private ConcurrentQueue<string> _idsToRemove = new ConcurrentQueue<string>();
 
@@ -54,10 +73,10 @@ namespace FlashscoreOverlay
 
 /* ── CABECERA LIGA ───────────────────────────────────────────────────── */
 ".fc-overlay-header {\n" +
-"    background-color: #1F2F37;\n" +
+"    background-color: #001e28;\n" +
 "    padding: 0 10px;\n" +
 "    height: 30px;\n" +
-"    border-bottom: 1px solid rgba(0,0,0,0.5);\n" +
+"    border-bottom: 1px solid #00141e;\n" +
 "    color: #accbd9;\n" +
 "    font-size: 10px !important;\n" +
 "    font-weight: 700;\n" +
@@ -67,6 +86,16 @@ namespace FlashscoreOverlay
 "    white-space: nowrap;\n" +
 "    overflow: hidden;\n" +
 "    cursor: default;\n" +
+"}\n" +
+".fc-header-pin {\n" +
+"    margin-left: auto;\n" +
+"    color: #0787FA;\n" +
+"    font-size: 14px;\n" +
+"}\n" +
+".fc-header-star {\n" +
+"    margin-right: 10px;\n" +
+"    color: #fff;\n" +
+"    font-size: 14px;\n" +
 "}\n" +
 /* Imagen de bandera: 20×15 via flagcdn.com */
 ".fc-flag-img {\n" +
@@ -87,50 +116,60 @@ namespace FlashscoreOverlay
 "}\n" +
 
 /* ── FILA DE PARTIDO ──────────────────────────────────────────────────
-   Columna 1 (minuto): 65px
-   Columna 2 (equipos): 1fr  → más estrecha pero con flex-wrap en los jugadores
-   Columna 3 (score): auto
-   Columna 4+ (parciales): 0px por defecto, se expande via JS
+   Columna 1 (estrella): 30px
+   Columna 2 (minuto): 40px
+   Columna 3 (equipos): 1fr  → más estrecha pero con flex-wrap en los jugadores
+   Columna 4 (score): auto
+   Columna 5+ (parciales): 0px por defecto, se expande via JS
    Filas: auto, sin altura fija → crecen para dobles (2 jugadores por equipo)
    ─────────────────────────────────────────────────────────────────── */
 ".event__match {\n" +
 "    display: grid !important;\n" +
-"    grid-template-columns: 65px 1fr auto 0px !important;\n" +
+"    grid-template-columns: 30px 40px 1fr auto 0px !important;\n" +
 "    grid-template-rows: auto auto !important;\n" +
 "    padding: 5px 8px;\n" +
-"    background-color: #00141E;\n" +
-"    border-bottom: 1px solid rgba(0,0,0,0.3);\n" +
+"    background-color: #00141e;\n" +
+"    border-bottom: 1px solid #0b1e28;\n" +
 "    min-height: 56px;\n" +
 "    align-items: center;\n" +
 "    gap: 0px 6px;\n" +
 "    position: relative;\n" +
 "    box-sizing: border-box;\n" +
 "}\n" +
-".event__match:hover { background-color: #001e2e; }\n" +
+".event__match:hover { background-color: #0b1e28; }\n" +
 ".bg-alert { background-color: #3D0314 !important; }\n" +
-
-/* ── COL 1: MINUTO / ESTADO ──────────────────────────────────────── */
-".event__stage, .event__time, .event__stage--live, .event__stage--finished {\n" +
+".fc-match-star {\n" +
 "    grid-column: 1; grid-row: 1 / 3;\n" +
+"    display: flex;\n" +
+"    align-items: center;\n" +
+"    justify-content: center;\n" +
+"    color: #fff;\n" +
+"    font-size: 16px;\n" +
+"}\n" +
+
+/* ── COL 2: MINUTO / ESTADO ──────────────────────────────────────── */
+".event__stage, .event__time, .event__stage--live, .event__stage--finished {\n" +
+"    grid-column: 2; grid-row: 1 / 3;\n" +
+"    color: #ff0046 !important;\n" +
+"    font-weight: 700 !important;\n" +
 "    text-align: center;\n" +
 "    font-size: 11px !important;\n" +
 "    opacity: 0.9;\n" +
 "    font-weight: 400;\n" +
 "    display: flex;\n" +
-"    justify-content: center;\n" +
+"    justify-content: flex-start;\n" +
 "    align-items: center;\n" +
-"    border-radius: 2px;\n" +
 "    height: 100%;\n" +
 "    align-self: stretch;\n" +
 "}\n" +
 ".fc-blink-apos { display: inline-block; margin-left: 1px; }\n" +
 
-/* ── COL 2: EQUIPOS ──────────────────────────────────────────────────
+/* ── COL 3: EQUIPOS ──────────────────────────────────────────────────
    Las filas del grid son auto-height.
    Para dobles, wcl-participants_ASufu apila los 2 jugadores en columna.
    ─────────────────────────────────────────────────────────────────── */
 ".event__homeParticipant, .event__participant--home {\n" +
-"    grid-column: 2; grid-row: 1;\n" +
+"    grid-column: 3; grid-row: 1;\n" +
 "    display: flex !important;\n" +
 "    align-items: center !important;\n" +
 "    overflow: hidden;\n" +
@@ -141,7 +180,7 @@ namespace FlashscoreOverlay
 "    align-self: center;\n" +
 "}\n" +
 ".event__awayParticipant, .event__participant--away {\n" +
-"    grid-column: 2; grid-row: 2;\n" +
+"    grid-column: 3; grid-row: 2;\n" +
 "    display: flex !important;\n" +
 "    align-items: center !important;\n" +
 "    overflow: hidden;\n" +
@@ -176,7 +215,7 @@ namespace FlashscoreOverlay
 "    display: block !important; flex-shrink: 0 !important;\n" +
 "}\n" +
 ".wcl-name_jjfMf, .event__participant {\n" +
-"    font-size: 12px !important; color: white; font-weight: 500;\n" +
+"    font-size: 13px !important; color: white; font-weight: 400;\n" +
 "    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;\n" +
 "    min-width: 0;\n" +
 "}\n" +
@@ -203,17 +242,19 @@ namespace FlashscoreOverlay
 "    opacity: 1 !important; flex-shrink: 0;\n" +
 "}\n" +
 
-/* ── COL 3: SCORE PRINCIPAL ──────────────────────────────────────── */
+/* ── COL 4: SCORE PRINCIPAL ──────────────────────────────────────── */
 ".event__score--home, .event__score:nth-of-type(1) {\n" +
-"    grid-column: 3; grid-row: 1;\n" +
-"    font-size: 12px !important; font-weight: 700 !important;\n" +
+"    grid-column: 4; grid-row: 1;\n" +
+"    font-size: 13px !important; font-weight: 700 !important;\n" +
+"    color: #ff0046 !important;\n" +
 "    display: flex; align-items: center; justify-content: flex-end;\n" +
 "    white-space: nowrap; padding-right: 10px;\n" +
 "    align-self: center;\n" +
 "}\n" +
 ".event__score--away, .event__score:nth-of-type(2) {\n" +
-"    grid-column: 3; grid-row: 2;\n" +
-"    font-size: 12px !important; font-weight: 700 !important;\n" +
+"    grid-column: 4; grid-row: 2;\n" +
+"    font-size: 13px !important; font-weight: 700 !important;\n" +
+"    color: #ff0046 !important;\n" +
 "    display: flex; align-items: center; justify-content: flex-end;\n" +
 "    white-space: nowrap; padding-right: 10px;\n" +
 "    align-self: center;\n" +
@@ -512,6 +553,7 @@ namespace FlashscoreOverlay
 
         public MainWindow()
         {
+            Instance = this;
             InitializeComponent();
             this.Background = new System.Windows.Media.SolidColorBrush(
                 (System.Windows.Media.Color)System.Windows.Media.ColorConverter.ConvertFromString("#00141E")
@@ -525,7 +567,8 @@ namespace FlashscoreOverlay
             this.MinHeight = 80;
 
             InitializeWebViewAsync();
-            StartWebServerAsync();
+            StartWebSocketServer();
+            _scrapeTimer = new Timer(async _ => await ScrapeMatches(), null, 2000, 5000);
         }
 
         private void Border_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
@@ -558,6 +601,9 @@ namespace FlashscoreOverlay
                 webView.DefaultBackgroundColor = System.Drawing.Color.Transparent;
                 webView.NavigateToString(BaseHtml);
                 webView.CoreWebView2.WebMessageReceived += CoreWebView2_WebMessageReceived;
+                
+                await scraperWebView.EnsureCoreWebView2Async();
+                
                 _isWebViewReady = true;
             }
             catch (Exception ex) { MessageBox.Show("Error WebView: " + ex.Message); }
@@ -602,55 +648,193 @@ namespace FlashscoreOverlay
             }
         }
 
-        private void StartWebServerAsync()
-        {
-            Task.Run(async () =>
-            {
-                _httpListener = new HttpListener();
-                _httpListener.Prefixes.Add(LocalServerUrl);
-                _httpListener.Start();
-                while (_httpListener.IsListening)
-                {
-                    try
-                    {
-                        var context = await _httpListener.GetContextAsync();
-                        _ = Task.Run(() => HandleRequest(context));
-                    }
-                    catch { }
-                }
-            });
-        }
-
-        private async void HandleRequest(HttpListenerContext context)
+        private void StartWebSocketServer()
         {
             try
             {
-                context.Response.AddHeader("Access-Control-Allow-Origin", "*");
-                if (context.Request.HttpMethod == "OPTIONS") { context.Response.Close(); return; }
+                _wssv = new WebSocketServer("ws://localhost:19000");
+                _wssv.AddWebSocketService<FlashscoreBehavior>("/flashscore");
+                _wssv.Start();
+            }
+            catch { }
+        }
 
-                string bodyContent = "";
-                using (var reader = new StreamReader(context.Request.InputStream, context.Request.ContentEncoding))
-                    bodyContent = await reader.ReadToEndAsync();
-
-                string responseString = "OK";
-                string idToRemove;
-                if (_idsToRemove.TryDequeue(out idToRemove))
-                    responseString = "REMOVE:" + idToRemove;
-
-                byte[] buffer = Encoding.UTF8.GetBytes(responseString);
-                context.Response.ContentLength64 = buffer.Length;
-                await context.Response.OutputStream.WriteAsync(buffer, 0, buffer.Length);
-                context.Response.Close();
-
-                if (_isWebViewReady && !string.IsNullOrEmpty(bodyContent))
+        public void HandleWebSocketMessage(string message)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(message);
+                var root = doc.RootElement;
+                if (root.TryGetProperty("action", out var actionProp))
                 {
-                    await Dispatcher.InvokeAsync(() =>
+                    string action = actionProp.GetString();
+                    if (action == "sync" && root.TryGetProperty("ids", out var idsProp))
                     {
-                        webView.CoreWebView2.PostWebMessageAsString(bodyContent);
-                    });
+                        var ids = idsProp.EnumerateArray().Select(x => x.GetString()).ToList();
+                        var currentKeys = _trackedMatches.Keys.ToList();
+                        foreach (var key in currentKeys) if (!ids.Contains(key)) _trackedMatches.TryRemove(key, out _);
+                        foreach (var id in ids) _trackedMatches.TryAdd(id, id);
+                        _ = ScrapeMatches(); // Trigger immediate scrape
+                    }
+                    else if (action == "add" && root.TryGetProperty("matchId", out var addIdProp))
+                    {
+                        _trackedMatches.TryAdd(addIdProp.GetString(), addIdProp.GetString());
+                        _ = ScrapeMatches(); // Trigger immediate scrape
+                    }
+                    else if (action == "remove" && root.TryGetProperty("matchId", out var rmIdProp))
+                    {
+                        _trackedMatches.TryRemove(rmIdProp.GetString(), out _);
+                        _ = ScrapeMatches(); // Update UI
+                    }
                 }
             }
             catch { }
+        }
+
+        private async Task ScrapeMatches()
+        {
+            if (!_isWebViewReady) return;
+            if (_trackedMatches.IsEmpty)
+            {
+                await Dispatcher.InvokeAsync(() => webView.CoreWebView2.PostWebMessageAsString("<div style='display:flex;height:60px;align-items:center;justify-content:center;color:#667;font-size:11px;'>Selecciona partidos</div>"));
+                return;
+            }
+
+            var config = Configuration.Default;
+            using var context = BrowsingContext.New(config);
+            var leaguesMap = new Dictionary<string, (string headerHtml, List<string> matchesHtml)>();
+
+            foreach (var matchId in _trackedMatches.Keys.ToList())
+            {
+                try
+                {
+                    string idPart = matchId.Contains("_") ? matchId.Split('_').Last() : matchId;
+                    string url = $"https://www.flashscore.es/partido/{idPart}/#/resumen-del-partido";
+                    
+                    bool loaded = false;
+                    void NavigationCompletedHandler(object sender, CoreWebView2NavigationCompletedEventArgs e) => loaded = true;
+                    
+                    await Dispatcher.InvokeAsync(() => {
+                        scraperWebView.CoreWebView2.NavigationCompleted += NavigationCompletedHandler;
+                        scraperWebView.CoreWebView2.Navigate(url);
+                    });
+
+                    // Wait for it to load, timeout 5s
+                    for (int i=0; i<50 && !loaded; i++) await Task.Delay(100);
+                    
+                    await Dispatcher.InvokeAsync(() => scraperWebView.CoreWebView2.NavigationCompleted -= NavigationCompletedHandler);
+
+                    if (!loaded) continue;
+                    
+                    // Wait an extra second for JS to execute and populate
+                    await Task.Delay(1000);
+
+                    string html = await Dispatcher.InvokeAsync(async () => {
+                        return await scraperWebView.CoreWebView2.ExecuteScriptAsync("document.documentElement.outerHTML;");
+                    }).Task.Unwrap();
+                    
+                    // Decode the weird JSON string encoding returned by ExecuteScriptAsync
+                    if (html.StartsWith("\"") && html.EndsWith("\""))
+                    {
+                        html = System.Text.RegularExpressions.Regex.Unescape(html.Substring(1, html.Length - 2));
+                    }
+
+                    System.IO.File.WriteAllText("debug_scraper.html", html);
+
+                    var doc = await context.OpenAsync(req => req.Content(html));
+
+                    var leagueNameNode = doc.QuerySelector(".tournamentHeader__country")?.TextContent?.Trim() ?? "LEAGUE";
+                    var leagueLinkNode = doc.QuerySelector(".tournamentHeader__link");
+                    var leagueTitle = leagueLinkNode?.TextContent?.Trim() ?? "NAME";
+                    string fullLeagueName = $"{leagueNameNode}: {leagueTitle}";
+
+                    var homeTeam = doc.QuerySelector(".duelParticipant__home .participant__participantName")?.TextContent?.Trim() ?? "Home";
+                    var awayTeam = doc.QuerySelector(".duelParticipant__away .participant__participantName")?.TextContent?.Trim() ?? "Away";
+
+                    var homeImg = doc.QuerySelector(".duelParticipant__home img.participant__image")?.GetAttribute("src") ?? "";
+                    var awayImg = doc.QuerySelector(".duelParticipant__away img.participant__image")?.GetAttribute("src") ?? "";
+                    string homeImgHtml = string.IsNullOrEmpty(homeImg) ? "" : $"<img class=\"event__logo\" src=\"{homeImg}\" />";
+                    string awayImgHtml = string.IsNullOrEmpty(awayImg) ? "" : $"<img class=\"event__logo\" src=\"{awayImg}\" />";
+
+                    var homeScore = "-";
+                    var awayScore = "-";
+                    var scoreSpans = doc.QuerySelectorAll(".detailScore__wrapper span").ToList();
+                    if (scoreSpans.Count >= 3)
+                    {
+                        homeScore = scoreSpans[0].TextContent.Trim();
+                        awayScore = scoreSpans[2].TextContent.Trim();
+                    }
+
+                    var timeSpans = doc.QuerySelectorAll(".detailScore__status span").Select(s => s.TextContent.Trim()).Where(s => !string.IsNullOrEmpty(s)).ToList();
+                    var matchTime = string.Join(" ", timeSpans);
+                    if (string.IsNullOrEmpty(matchTime))
+                    {
+                        matchTime = doc.QuerySelector(".detailScore__status")?.TextContent?.Trim()
+                                    ?? doc.QuerySelector(".duelParticipant__startTime")?.TextContent?.Trim()
+                                    ?? "";
+                    }
+                    else if (timeSpans.Count == 2 && int.TryParse(timeSpans[1], out _))
+                    {
+                        // Some live matches have "2º tiempo" and "52". Just show the number or both based on user pref.
+                        // We will show just the minute, since the image in user's request only showed "52" with red color.
+                        matchTime = timeSpans[1];
+                    }
+                    else if (timeSpans.Count == 1 && int.TryParse(timeSpans[0].TrimEnd('\''), out _))
+                    {
+                        matchTime = timeSpans[0].TrimEnd('\'');
+                    }
+                    else 
+                    {
+                        // Try to find if there's a specific time class
+                        var timeNode = doc.QuerySelector(".detailScore__status .fixedHeaderDuel__time");
+                        if (timeNode != null) matchTime = timeNode.TextContent.Trim();
+                        else if (matchTime.Contains(" ")) 
+                        {
+                            // if it says "2º tiempo 52", try to show just "52".
+                            var parts = matchTime.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            var lastWord = parts.Last().TrimEnd('\'');
+                            if (int.TryParse(lastWord, out _)) matchTime = lastWord;
+                        }
+                    }
+
+                    string matchHtml = $@"<div class=""event__match"" id=""{matchId}"">
+                        <div class=""fc-match-star"">☆</div>
+                        <div class=""event__time"">{matchTime}</div>
+                        <div class=""event__participant--home"">{homeImgHtml}<div class=""event__participant"">{homeTeam}</div></div>
+                        <div class=""event__participant--away"">{awayImgHtml}<div class=""event__participant"">{awayTeam}</div></div>
+                        <div class=""event__score--home"">{homeScore}</div>
+                        <div class=""event__score--away"">{awayScore}</div>
+                    </div>";
+
+                    if (!leaguesMap.ContainsKey(fullLeagueName))
+                    {
+                        string headerHtml = $@"<div class=""fc-header-star"">☆</div><span style=""flex-shrink:0;white-space:nowrap;"">{leagueNameNode}:</span><span class=""fc-league-name"">{leagueTitle}</span><div class=""fc-header-pin"">📌</div>";
+                        leaguesMap[fullLeagueName] = (headerHtml, new List<string>());
+                    }
+                    leaguesMap[fullLeagueName].matchesHtml.Add(matchHtml);
+                }
+                catch { }
+            }
+
+            string finalHtml = "";
+            foreach (var kvp in leaguesMap)
+            {
+                finalHtml += $@"<div class=""fc-league-section"">
+                    <div class=""fc-overlay-header"">{kvp.Value.headerHtml}</div>
+                    <div class=""fc-matches-container"">{string.Join("", kvp.Value.matchesHtml)}</div>
+                </div>";
+            }
+            if (string.IsNullOrEmpty(finalHtml)) finalHtml = "<div style='display:flex;height:60px;align-items:center;justify-content:center;color:#667;font-size:11px;'>Selecciona partidos</div>";
+
+            await Dispatcher.InvokeAsync(() => webView.CoreWebView2.PostWebMessageAsString(finalHtml));
+            
+            // Send clear commands for removed IDs
+            string idToRemove;
+            while (_idsToRemove.TryDequeue(out idToRemove))
+            {
+                _trackedMatches.TryRemove(idToRemove, out _);
+                try { _wssv?.WebSocketServices["/flashscore"]?.Sessions.Broadcast($@"{{ ""action"": ""remove"", ""matchId"": ""{idToRemove}"" }}"); } catch { }
+            }
         }
     }
 }

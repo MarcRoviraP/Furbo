@@ -21,6 +21,9 @@
             ClipToBounds="True"
             MouseLeftButtonDown="Border_MouseLeftButtonDown">
 
-        <wv2:WebView2 Name="webView" />
+        <Grid>
+            <wv2:WebView2 Name="scraperWebView" Visibility="Collapsed" />
+            <wv2:WebView2 Name="webView" />
+        </Grid>
     </Border>
 </Window>
