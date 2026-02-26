@@ -140,6 +140,7 @@ namespace FlashscoreOverlay
 
         // ── Scraping cache ──
         private readonly ConcurrentDictionary<string, ScrapingCacheEntry> _scrapingCache = new();
+        private readonly HashSet<string> _cachedMatchIds = new();  // Track cached match IDs
         private long _cacheStatsHits = 0;
         private long _cacheStatsMisses = 0;
 
@@ -365,7 +366,13 @@ namespace FlashscoreOverlay
                         if (existing != null)
                         {
                             // Check score changes for alerts
-                            if (existing.HomeScore != nd.HomeScore || existing.AwayScore != nd.AwayScore)
+                            // Only trigger alert if BOTH old and new scores are valid (not "-")
+                            // This avoids false alerts from failed score extraction
+                            bool oldScoreValid = existing.HomeScore != "-" && existing.AwayScore != "-";
+                            bool newScoreValid = nd.HomeScore != "-" && nd.AwayScore != "-";
+
+                            if (oldScoreValid && newScoreValid && 
+                                (existing.HomeScore != nd.HomeScore || existing.AwayScore != nd.AwayScore))
                             {
                                 nd.AlertExpiresMs = nowMs + 10000;
                             }
@@ -432,12 +439,29 @@ namespace FlashscoreOverlay
                 var data = new MatchData { MatchId = matchId };
                 long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
+                // ═══════════════════════════════════════════════════════════
+                // ESPERAR A QUE LA PÁGINA ESTÉ COMPLETAMENTE CARGADA
+                // ═══════════════════════════════════════════════════════════
+
+                // Esperar a que el network esté idle (todas las peticiones AJAX terminadas)
+                await page.WaitForLoadStateAsync(LoadState.NetworkIdle);
+
+                // Esperar a que el contenedor de scores exista (indica que el JS renderizó)
+                await page.WaitForSelectorAsync(".detailScore__wrapper, .detailScore, .duelParticipant", new()
+                {
+                    State = WaitForSelectorState.Visible,
+                    Timeout = 10000
+                });
+
+                // Pequeña espera adicional para asegurar que el JS haya poblado los datos
+                await Task.Delay(500);
+
                 // ─ Check cache for STATIC data only ─
                 bool cacheHit = false;
                 if (_scrapingCache.TryGetValue(matchId, out var cachedEntry) && !cachedEntry.IsExpired)
                 {
                     Interlocked.Increment(ref _cacheStatsHits);
-                    Console.WriteLine($"[CACHE] ✓ HIT for {matchId} (hits: {_cacheStatsHits}, misses: {_cacheStatsMisses})");
+                    Console.WriteLine($"[CACHE] ✓ HIT for {matchId}");
                     cacheHit = true;
 
                     // Use cached static data
@@ -453,31 +477,24 @@ namespace FlashscoreOverlay
                 else
                 {
                     Interlocked.Increment(ref _cacheStatsMisses);
-                    Console.WriteLine($"[CACHE] ✗ MISS for {matchId} (hits: {_cacheStatsHits}, misses: {_cacheStatsMisses})");
+                    Console.WriteLine($"[CACHE] ✗ MISS for {matchId}");
 
-                    // League info — from breadcrumbs (wcl-breadcrumbs)
-                    // Breadcrumb items: [Fútbol] → [España] → [LaLiga Hypermotion - Jornada 25]
+                    // League info — from breadcrumbs
                     var breadcrumbItems = await page.QuerySelectorAllAsync(".wcl-breadcrumbs_0ZcSd li");
                     if (breadcrumbItems.Count >= 3)
                     {
-                        // country = 2nd breadcrumb (e.g. "España")
                         var countryElement = breadcrumbItems[1];
-
-                        // Extract league flag image with multiple fallback strategies
                         data.LeagueImgSrc = await ExtractLeagueFlagImage(page, countryElement);
-
-                        var countryText = await countryElement.TextContentAsync();
-                        data.LeagueCountry = countryText?.Trim() ?? "LEAGUE";
-                        // league = 3rd breadcrumb (e.g. "LaLiga Hypermotion - Jornada 25")
+                        data.LeagueCountry = (await countryElement.TextContentAsync())?.Trim() ?? "LEAGUE";
                         data.League = (await breadcrumbItems[2].TextContentAsync())?.Trim() ?? "NAME";
-                        // league URL from last breadcrumb link
+
                         var leagueLink = await breadcrumbItems[2].QuerySelectorAsync("a");
                         var href = leagueLink != null ? await leagueLink.GetAttributeAsync("href") : null;
                         data.LeagueUrl = href != null ? $"https://www.flashscore.es{href}" : "";
                     }
                     else
                     {
-                        // Fallback: try og:description meta tag (e.g. "ESPAÑA: LaLiga Hypermotion - Jornada 25")
+                        // Fallback...
                         var ogDesc = await SafeAttribute(page, "meta[property='og:description']", "content");
                         if (!string.IsNullOrEmpty(ogDesc) && ogDesc.Contains(":"))
                         {
@@ -486,7 +503,6 @@ namespace FlashscoreOverlay
                             data.League = parts.Length > 1 ? parts[1].Trim() : "NAME";
                         }
                         data.LeagueUrl = "";
-                        // Try to find flag image as fallback
                         data.LeagueImgSrc = await ExtractLeagueFlagImageGlobal(page);
                     }
 
@@ -499,78 +515,61 @@ namespace FlashscoreOverlay
                     data.AwayImg = await SafeAttribute(page, ".duelParticipant__away img.participant__image", "src") ?? "";
                 }
 
-                // ─ ALWAYS extract DYNAMIC data (score, time) from page ─
-                // Scores — check detailScore__wrapper first, then duelParticipant__score
-                var scoreSpans = await page.QuerySelectorAllAsync(".detailScore__wrapper span");
-                if (scoreSpans.Count >= 3)
+                // ═══════════════════════════════════════════════════════════
+                // EXTRACCIÓN DE SCORES CON ESPERAS Y RETRIES
+                // ═══════════════════════════════════════════════════════════
+
+                data.HomeScore = "-";
+                data.AwayScore = "-";
+
+                // Intentar obtener scores con retry
+                for (int attempt = 0; attempt < 5; attempt++)
                 {
-                    data.HomeScore = (await scoreSpans[0].TextContentAsync())?.Trim() ?? "-";
-                    data.AwayScore = (await scoreSpans[2].TextContentAsync())?.Trim() ?? "-";
-                }
-                else
-                {
-                    // Match not started or score area structured differently
-                    var scoreText = await SafeTextContent(page, ".duelParticipant__score");
-                    if (!string.IsNullOrEmpty(scoreText) && scoreText.Contains("-"))
+                    var scores = await TryExtractScores(page);
+                    if (scores != null)
                     {
-                        var parts = scoreText.Split('-');
-                        data.HomeScore = parts[0].Trim();
-                        data.AwayScore = parts.Length > 1 ? parts[1].Trim() : "-";
+                        data.HomeScore = scores.Value.Home;
+                        data.AwayScore = scores.Value.Away;
+                        Console.WriteLine($"[SCORE] ✓ {data.HomeScore} - {data.AwayScore} (attempt {attempt + 1})");
+                        break;
                     }
-                    // else stays as default "-"
+
+                    // Esperar antes de reintentar
+                    await Task.Delay(200);
                 }
 
-                // Match time/status
-
-                // Checkpoint Get Time
-                var timeSpans = await page.QuerySelectorAllAsync(".detailScore__status span");
-                var timeTexts = new List<string>();
-                foreach (var span in timeSpans)
+                if (data.HomeScore == "-" && data.AwayScore == "-")
                 {
-                    var txt = (await span.TextContentAsync())?.Trim() ?? "";
-                    if (!string.IsNullOrEmpty(txt)) timeTexts.Add(txt);
+                    Console.WriteLine($"[SCORE] ✗ Could not extract scores after retries");
                 }
 
-                if (timeTexts.Count == 0)
-                {
-                    data.MatchTime = await SafeTextContent(page, ".detailScore__status") ?? "";
-                    if (string.IsNullOrEmpty(data.MatchTime))
-                        data.MatchTime = await SafeTextContent(page, ".duelParticipant__startTime") ?? "";
-                }
-                else if (timeTexts.Count == 2 && int.TryParse(timeTexts[1], out _))
-                {
-                    data.MatchTime = timeTexts[1]; // e.g. "2º tiempo" + "52" → show "52"
-                }
-                else if (timeTexts.Count == 1 && int.TryParse(timeTexts[0].TrimEnd('\''), out _))
-                {
-                    data.MatchTime = timeTexts[0].TrimEnd('\'');
-                }
-                else
-                {
-                    var joined = string.Join(" ", timeTexts);
-                    var parts2 = joined.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                    var lastWord = parts2.Last().TrimEnd('\'');
-                    if (int.TryParse(lastWord, out _)) data.MatchTime = lastWord;
-                    else data.MatchTime = joined;
-                }
+                // ═══════════════════════════════════════════════════════════
+                // EXTRACCIÓN DE TIEMPO CON ESPERAS
+                // ═══════════════════════════════════════════════════════════
+
+                data.MatchTime = await ExtractMatchTime(page);
 
                 // ─ Cache the scraped data ─
-                var cacheEntry = new ScrapingCacheEntry
+                if (!cacheHit)
                 {
-                    MatchId = data.MatchId,
-                    HomeTeam = data.HomeTeam,
-                    AwayTeam = data.AwayTeam,
-                    League = data.League,
-                    LeagueCountry = data.LeagueCountry,
-                    HomeImg = data.HomeImg,
-                    AwayImg = data.AwayImg,
-                    LeagueUrl = data.LeagueUrl,
-                    LeagueImgSrc = data.LeagueImgSrc,
-                    CachedAtMs = nowMs,
-                    ExpiresAtMs = nowMs + SCRAPING_CACHE_DURATION_MS
-                };
-                _scrapingCache.AddOrUpdate(matchId, cacheEntry, (_, __) => cacheEntry);
-                Console.WriteLine($"[CACHE] ✓ STORED {matchId} (expires in {SCRAPING_CACHE_DURATION_MS / 60000} min)");
+                    var cacheEntry = new ScrapingCacheEntry
+                    {
+                        MatchId = data.MatchId,
+                        HomeTeam = data.HomeTeam,
+                        AwayTeam = data.AwayTeam,
+                        League = data.League,
+                        LeagueCountry = data.LeagueCountry,
+                        HomeImg = data.HomeImg,
+                        AwayImg = data.AwayImg,
+                        LeagueUrl = data.LeagueUrl,
+                        LeagueImgSrc = data.LeagueImgSrc,
+                        CachedAtMs = nowMs,
+                        ExpiresAtMs = nowMs + SCRAPING_CACHE_DURATION_MS
+                    };
+                    _scrapingCache.AddOrUpdate(matchId, cacheEntry, (_, __) => cacheEntry);
+                    RegisterCachedMatchId(matchId);
+                    Console.WriteLine($"[CACHE] ✓ STORED {matchId}");
+                }
 
                 return data;
             }
@@ -581,17 +580,160 @@ namespace FlashscoreOverlay
             }
         }
 
+        // ═════════════════════════════════════════════════════════════════
+        // MÉTODO AUXILIAR: Extraer scores con múltiples estrategias
+        // ═════════════════════════════════════════════════════════════════
+
+        private async Task<(string Home, string Away)?> TryExtractScores(IPage page)
+        {
+            // Estrategia 1: detailScore__wrapper
+            var scoreWrapper = await page.QuerySelectorAsync(".detailScore__wrapper");
+            if (scoreWrapper != null)
+            {
+                var spans = await scoreWrapper.QuerySelectorAllAsync("span");
+                if (spans.Count >= 3)
+                {
+                    var home = (await spans[0].TextContentAsync())?.Trim();
+                    var away = (await spans[2].TextContentAsync())?.Trim();
+
+                    if (IsValidScore(home) && IsValidScore(away))
+                        return (home!, away!);
+                }
+            }
+
+            // Estrategia 2: duelParticipant__score individual
+            var homeScoreEl = await page.QuerySelectorAsync(".duelParticipant__home .duelParticipant__score");
+            var awayScoreEl = await page.QuerySelectorAsync(".duelParticipant__away .duelParticipant__score");
+
+            if (homeScoreEl != null && awayScoreEl != null)
+            {
+                var home = (await homeScoreEl.TextContentAsync())?.Trim();
+                var away = (await awayScoreEl.TextContentAsync())?.Trim();
+
+                if (IsValidScore(home) && IsValidScore(away))
+                    return (home!, away!);
+            }
+
+            // Estrategia 3: detailScore general
+            var detailScore = await page.QuerySelectorAsync(".detailScore");
+            if (detailScore != null)
+            {
+                // Usar EvaluateAsync para obtener texto directamente del DOM
+                var scores = await detailScore.EvaluateAsync<string[]>(@"
+            el => {
+                const spans = el.querySelectorAll(':scope > span');
+                return [spans[0]?.innerText, spans[2]?.innerText];
+            }
+        ");
+
+                if (scores != null && scores.Length >= 2 &&
+                    IsValidScore(scores[0]) && IsValidScore(scores[1]))
+                    return (scores[0]!, scores[1]!);
+            }
+
+            return null;
+        }
+
+        private bool IsValidScore(string? score)
+        {
+            if (string.IsNullOrEmpty(score)) return false;
+            // Acepta números o guiones (para partidos no iniciados)
+            return score == "-" || int.TryParse(score, out _);
+        }
+
+        // ═════════════════════════════════════════════════════════════════
+        // MÉTODO AUXILIAR: Extraer tiempo del partido
+        // ═════════════════════════════════════════════════════════════════
+
+        private async Task<string> ExtractMatchTime(IPage page)
+        {
+            // Esperar a que alguno de los elementos de tiempo exista
+            await page.WaitForSelectorAsync(".eventTime, .detailScore__status, .duelParticipant__startTime", new()
+            {
+                Timeout = 5000
+            });
+
+            // ═══════════════════════════════════════════════════════════
+            // ESTRATEGIA 1: eventTime (ej: <span class="eventTime">26<span class="event__timeIndicator">'</span></span>)
+            // ═══════════════════════════════════════════════════════════
+            var eventTimeEl = await page.QuerySelectorAsync(".eventTime");
+            if (eventTimeEl != null)
+            {
+                // Obtener solo el texto del span principal (ignorar el timeIndicator)
+                var timeText = await eventTimeEl.TextContentAsync();
+                if (!string.IsNullOrEmpty(timeText))
+                {
+                    // Limpiar: quitar el apóstrofe y espacios
+                    var cleaned = timeText.Trim().TrimEnd('\'').Trim();
+
+                    // Verificar que sea un número válido
+                    if (int.TryParse(cleaned, out _))
+                    {
+                        Console.WriteLine($"[TIME] ✓ From eventTime: {cleaned}");
+                        return cleaned;
+                    }
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // ESTRATEGIA 2: spans dentro de detailScore__status
+            // ═══════════════════════════════════════════════════════════
+            var statusWrapper = await page.QuerySelectorAsync(".detailScore__status");
+            if (statusWrapper != null)
+            {
+                var spans = await statusWrapper.QuerySelectorAllAsync("span");
+                var texts = new List<string>();
+
+                foreach (var span in spans)
+                {
+                    var txt = (await span.TextContentAsync())?.Trim();
+                    if (!string.IsNullOrEmpty(txt)) texts.Add(txt);
+                }
+
+                if (texts.Count > 0)
+                {
+                    // Buscar número al final (tiempo)
+                    var joined = string.Join(" ", texts);
+                    var parts = joined.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                    if (parts.Length > 0)
+                    {
+                        var last = parts.Last().TrimEnd('\'');
+                        if (int.TryParse(last, out _)) return last;
+                    }
+
+                    return joined;
+                }
+            }
+
+            // ═══════════════════════════════════════════════════════════
+            // ESTRATEGIA 3: texto directo de detailScore__status
+            // ═══════════════════════════════════════════════════════════
+            var statusText = await SafeTextContent(page, ".detailScore__status");
+            if (!string.IsNullOrEmpty(statusText)) return statusText;
+
+            // ═══════════════════════════════════════════════════════════
+            // ESTRATEGIA 4: duelParticipant__startTime
+            // ═══════════════════════════════════════════════════════════
+            var startTime = await SafeTextContent(page, ".duelParticipant__startTime");
+            if (!string.IsNullOrEmpty(startTime)) return startTime;
+
+            return "";
+        }
+
+        // Mantener tus métodos auxiliares existentes
         private async Task<string?> SafeTextContent(IPage page, string selector)
         {
             var el = await page.QuerySelectorAsync(selector);
             return el != null ? (await el.TextContentAsync())?.Trim() : null;
         }
 
-        private async Task<string?> SafeAttribute(IPage page, string selector, string attr)
+        private async Task<string?> SafeAttribute(IPage page, string selector, string attribute)
         {
             var el = await page.QuerySelectorAsync(selector);
-            return el != null ? await el.GetAttributeAsync(attr) : null;
+            return el != null ? await el.GetAttributeAsync(attribute) : null;
         }
+
 
         // ─ Extract league flag image with multiple strategies ─
         private async Task<string> ExtractLeagueFlagImage(IPage page, IElementHandle countryElement)
@@ -739,7 +881,32 @@ namespace FlashscoreOverlay
         {
             if (_scrapingCache.TryRemove(matchId, out _))
             {
+                _cachedMatchIds.Remove(matchId);
                 Console.WriteLine($"[CACHE] Invalidated cache for {matchId}");
+            }
+        }
+
+        private void RegisterCachedMatchId(string matchId)
+        {
+            lock (_cachedMatchIds)
+            {
+                _cachedMatchIds.Add(matchId);
+            }
+        }
+
+        public List<string> GetCachedMatchIds()
+        {
+            lock (_cachedMatchIds)
+            {
+                return _cachedMatchIds.ToList();
+            }
+        }
+
+        public bool IsCachedMatch(string matchId)
+        {
+            lock (_cachedMatchIds)
+            {
+                return _cachedMatchIds.Contains(matchId);
             }
         }
 
