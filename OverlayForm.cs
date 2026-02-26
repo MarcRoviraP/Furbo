@@ -20,6 +20,26 @@ using WebSocketSharp.Server;
 namespace FlashscoreOverlay
 {
     // ═══════════════════════════════════════════════════════════════════
+    //  Scraping Cache Data
+    // ═══════════════════════════════════════════════════════════════════
+    public class ScrapingCacheEntry
+    {
+        public string MatchId { get; set; } = "";
+        public string HomeTeam { get; set; } = "";
+        public string AwayTeam { get; set; } = "";
+        public string League { get; set; } = "";
+        public string LeagueCountry { get; set; } = "";
+        public string HomeImg { get; set; } = "";
+        public string AwayImg { get; set; } = "";
+        public string LeagueUrl { get; set; } = "";
+        public string LeagueImgSrc { get; set; } = "";
+        public long CachedAtMs { get; set; } = 0;
+        public long ExpiresAtMs { get; set; } = 0;
+
+        public bool IsExpired => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() > ExpiresAtMs;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
     //  Data models
     // ═══════════════════════════════════════════════════════════════════
     public class MatchData
@@ -35,6 +55,7 @@ namespace FlashscoreOverlay
         public string HomeImg { get; set; } = "";
         public string AwayImg { get; set; } = "";
         public string LeagueUrl { get; set; } = "";
+        public string LeagueImgSrc { get; set; } = "";
 
         // Alert state
         public string PrevHomeScore { get; set; } = "-";
@@ -96,6 +117,9 @@ namespace FlashscoreOverlay
         private const int LOGO_SIZE = 14;
         private const int PADDING_H = 8;
 
+        // ── Cache configuration ──
+        private const long SCRAPING_CACHE_DURATION_MS = 3600000; // 1 hora
+
         // ── State ──
         private WebSocketServer? _wssv;
         private System.Threading.Timer? _scrapeTimer;
@@ -113,6 +137,11 @@ namespace FlashscoreOverlay
         private IPlaywright? _playwright;
         private IBrowser? _browser;
         private bool _isScraping = false;
+
+        // ── Scraping cache ──
+        private readonly ConcurrentDictionary<string, ScrapingCacheEntry> _scrapingCache = new();
+        private long _cacheStatsHits = 0;
+        private long _cacheStatsMisses = 0;
 
         // ── Image cache ──
         private static readonly HttpClient _httpClient = new();
@@ -236,6 +265,7 @@ namespace FlashscoreOverlay
                     _trackedIds.TryRemove(rmId, out _);
                     lock (_matchLock) { _matches.RemoveAll(m => m.MatchId == rmId); }
                     _removedIds.Add(rmId);
+                    InvalidateCacheForMatch(rmId);
                     this.BeginInvoke(() => { RecalcHeight(); Invalidate(); });
                 }
             }
@@ -270,6 +300,10 @@ namespace FlashscoreOverlay
                 }
 
                 Console.WriteLine($"[SCRAPE] Starting scrape of {_trackedIds.Count} matches: [{string.Join(", ", _trackedIds.Keys)}]");
+
+                // ─ Clean expired cache entries ─
+                ClearExpiredCacheEntries();
+
                 var newMatches = new List<MatchData>();
 
                 foreach (var matchId in _trackedIds.Keys.ToList())
@@ -378,6 +412,7 @@ namespace FlashscoreOverlay
                 }
 
                 Console.WriteLine($"[SCRAPE] Done. Total matches: {_matches.Count}");
+                PrintCacheStatistics();
                 this.BeginInvoke(() => { RecalcHeight(); Invalidate(); });
             }
             catch (Exception ex)
@@ -395,42 +430,76 @@ namespace FlashscoreOverlay
             try
             {
                 var data = new MatchData { MatchId = matchId };
+                long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 
-                // League info — from breadcrumbs (wcl-breadcrumbs)
-                // Breadcrumb items: [Fútbol] → [España] → [LaLiga Hypermotion - Jornada 25]
-                var breadcrumbItems = await page.QuerySelectorAllAsync(".wcl-breadcrumbs_0ZcSd li");
-                if (breadcrumbItems.Count >= 3)
+                // ─ Check cache for STATIC data only ─
+                bool cacheHit = false;
+                if (_scrapingCache.TryGetValue(matchId, out var cachedEntry) && !cachedEntry.IsExpired)
                 {
-                    // country = 2nd breadcrumb (e.g. "España")
-                    data.LeagueCountry = (await breadcrumbItems[1].TextContentAsync())?.Trim() ?? "LEAGUE";
-                    // league = 3rd breadcrumb (e.g. "LaLiga Hypermotion - Jornada 25")
-                    data.League = (await breadcrumbItems[2].TextContentAsync())?.Trim() ?? "NAME";
-                    // league URL from last breadcrumb link
-                    var leagueLink = await breadcrumbItems[2].QuerySelectorAsync("a");
-                    var href = leagueLink != null ? await leagueLink.GetAttributeAsync("href") : null;
-                    data.LeagueUrl = href != null ? $"https://www.flashscore.es{href}" : "";
+                    Interlocked.Increment(ref _cacheStatsHits);
+                    Console.WriteLine($"[CACHE] ✓ HIT for {matchId} (hits: {_cacheStatsHits}, misses: {_cacheStatsMisses})");
+                    cacheHit = true;
+
+                    // Use cached static data
+                    data.HomeTeam = cachedEntry.HomeTeam;
+                    data.AwayTeam = cachedEntry.AwayTeam;
+                    data.League = cachedEntry.League;
+                    data.LeagueCountry = cachedEntry.LeagueCountry;
+                    data.HomeImg = cachedEntry.HomeImg;
+                    data.AwayImg = cachedEntry.AwayImg;
+                    data.LeagueUrl = cachedEntry.LeagueUrl;
+                    data.LeagueImgSrc = cachedEntry.LeagueImgSrc;
                 }
                 else
                 {
-                    // Fallback: try og:description meta tag (e.g. "ESPAÑA: LaLiga Hypermotion - Jornada 25")
-                    var ogDesc = await SafeAttribute(page, "meta[property='og:description']", "content");
-                    if (!string.IsNullOrEmpty(ogDesc) && ogDesc.Contains(":"))
+                    Interlocked.Increment(ref _cacheStatsMisses);
+                    Console.WriteLine($"[CACHE] ✗ MISS for {matchId} (hits: {_cacheStatsHits}, misses: {_cacheStatsMisses})");
+
+                    // League info — from breadcrumbs (wcl-breadcrumbs)
+                    // Breadcrumb items: [Fútbol] → [España] → [LaLiga Hypermotion - Jornada 25]
+                    var breadcrumbItems = await page.QuerySelectorAllAsync(".wcl-breadcrumbs_0ZcSd li");
+                    if (breadcrumbItems.Count >= 3)
                     {
-                        var parts = ogDesc.Split(':', 2);
-                        data.LeagueCountry = parts[0].Trim();
-                        data.League = parts.Length > 1 ? parts[1].Trim() : "NAME";
+                        // country = 2nd breadcrumb (e.g. "España")
+                        var countryElement = breadcrumbItems[1];
+
+                        // Extract league flag image with multiple fallback strategies
+                        data.LeagueImgSrc = await ExtractLeagueFlagImage(page, countryElement);
+
+                        var countryText = await countryElement.TextContentAsync();
+                        data.LeagueCountry = countryText?.Trim() ?? "LEAGUE";
+                        // league = 3rd breadcrumb (e.g. "LaLiga Hypermotion - Jornada 25")
+                        data.League = (await breadcrumbItems[2].TextContentAsync())?.Trim() ?? "NAME";
+                        // league URL from last breadcrumb link
+                        var leagueLink = await breadcrumbItems[2].QuerySelectorAsync("a");
+                        var href = leagueLink != null ? await leagueLink.GetAttributeAsync("href") : null;
+                        data.LeagueUrl = href != null ? $"https://www.flashscore.es{href}" : "";
                     }
-                    data.LeagueUrl = "";
+                    else
+                    {
+                        // Fallback: try og:description meta tag (e.g. "ESPAÑA: LaLiga Hypermotion - Jornada 25")
+                        var ogDesc = await SafeAttribute(page, "meta[property='og:description']", "content");
+                        if (!string.IsNullOrEmpty(ogDesc) && ogDesc.Contains(":"))
+                        {
+                            var parts = ogDesc.Split(':', 2);
+                            data.LeagueCountry = parts[0].Trim();
+                            data.League = parts.Length > 1 ? parts[1].Trim() : "NAME";
+                        }
+                        data.LeagueUrl = "";
+                        // Try to find flag image as fallback
+                        data.LeagueImgSrc = await ExtractLeagueFlagImageGlobal(page);
+                    }
+
+                    // Teams
+                    data.HomeTeam = await SafeTextContent(page, ".duelParticipant__home .participant__participantName") ?? "Home";
+                    data.AwayTeam = await SafeTextContent(page, ".duelParticipant__away .participant__participantName") ?? "Away";
+
+                    // Logos
+                    data.HomeImg = await SafeAttribute(page, ".duelParticipant__home img.participant__image", "src") ?? "";
+                    data.AwayImg = await SafeAttribute(page, ".duelParticipant__away img.participant__image", "src") ?? "";
                 }
 
-                // Teams
-                data.HomeTeam = await SafeTextContent(page, ".duelParticipant__home .participant__participantName") ?? "Home";
-                data.AwayTeam = await SafeTextContent(page, ".duelParticipant__away .participant__participantName") ?? "Away";
-
-                // Logos
-                data.HomeImg = await SafeAttribute(page, ".duelParticipant__home img.participant__image", "src") ?? "";
-                data.AwayImg = await SafeAttribute(page, ".duelParticipant__away img.participant__image", "src") ?? "";
-
+                // ─ ALWAYS extract DYNAMIC data (score, time) from page ─
                 // Scores — check detailScore__wrapper first, then duelParticipant__score
                 var scoreSpans = await page.QuerySelectorAllAsync(".detailScore__wrapper span");
                 if (scoreSpans.Count >= 3)
@@ -452,6 +521,8 @@ namespace FlashscoreOverlay
                 }
 
                 // Match time/status
+
+                // Checkpoint Get Time
                 var timeSpans = await page.QuerySelectorAllAsync(".detailScore__status span");
                 var timeTexts = new List<string>();
                 foreach (var span in timeSpans)
@@ -483,6 +554,24 @@ namespace FlashscoreOverlay
                     else data.MatchTime = joined;
                 }
 
+                // ─ Cache the scraped data ─
+                var cacheEntry = new ScrapingCacheEntry
+                {
+                    MatchId = data.MatchId,
+                    HomeTeam = data.HomeTeam,
+                    AwayTeam = data.AwayTeam,
+                    League = data.League,
+                    LeagueCountry = data.LeagueCountry,
+                    HomeImg = data.HomeImg,
+                    AwayImg = data.AwayImg,
+                    LeagueUrl = data.LeagueUrl,
+                    LeagueImgSrc = data.LeagueImgSrc,
+                    CachedAtMs = nowMs,
+                    ExpiresAtMs = nowMs + SCRAPING_CACHE_DURATION_MS
+                };
+                _scrapingCache.AddOrUpdate(matchId, cacheEntry, (_, __) => cacheEntry);
+                Console.WriteLine($"[CACHE] ✓ STORED {matchId} (expires in {SCRAPING_CACHE_DURATION_MS / 60000} min)");
+
                 return data;
             }
             catch (Exception ex)
@@ -502,6 +591,156 @@ namespace FlashscoreOverlay
         {
             var el = await page.QuerySelectorAsync(selector);
             return el != null ? await el.GetAttributeAsync(attr) : null;
+        }
+
+        // ─ Extract league flag image with multiple strategies ─
+        private async Task<string> ExtractLeagueFlagImage(IPage page, IElementHandle countryElement)
+        {
+            try
+            {
+                // Strategy 1: Direct img in country element
+                var imgElement = await countryElement.QuerySelectorAsync("img");
+                if (imgElement != null)
+                {
+                    var srcAttr = await imgElement.GetAttributeAsync("src");
+                    if (!string.IsNullOrEmpty(srcAttr))
+                    {
+                        Console.WriteLine($"[FLAG] Strategy 1 (direct img): Found {(srcAttr.StartsWith("data:") ? "base64" : "URL")}");
+                        return srcAttr;
+                    }
+                }
+
+                // Strategy 2: Try data-src (lazy loading)
+                if (imgElement != null)
+                {
+                    var dataSrcAttr = await imgElement.GetAttributeAsync("data-src");
+                    if (!string.IsNullOrEmpty(dataSrcAttr))
+                    {
+                        Console.WriteLine($"[FLAG] Strategy 2 (data-src): Found");
+                        return dataSrcAttr;
+                    }
+                }
+
+                // Strategy 3: Extract via style background-image
+                if (imgElement != null)
+                {
+                    var styleAttr = await imgElement.GetAttributeAsync("style");
+                    if (!string.IsNullOrEmpty(styleAttr) && styleAttr.Contains("background-image"))
+                    {
+                        var match = System.Text.RegularExpressions.Regex.Match(styleAttr, @"background-image:\s*url\(([^)]+)\)");
+                        if (match.Success)
+                        {
+                            var url = match.Groups[1].Value.Trim('\'', '"');
+                            if (!string.IsNullOrEmpty(url))
+                            {
+                                Console.WriteLine($"[FLAG] Strategy 3 (style background): Found");
+                                return url;
+                            }
+                        }
+                    }
+                }
+
+                // Strategy 4: Search for any img with wcl-flag class
+                var flagImg = await countryElement.QuerySelectorAsync("img[class*='wcl-flag']");
+                if (flagImg != null)
+                {
+                    var srcAttr = await flagImg.GetAttributeAsync("src");
+                    if (!string.IsNullOrEmpty(srcAttr))
+                    {
+                        Console.WriteLine($"[FLAG] Strategy 4 (wcl-flag class): Found");
+                        return srcAttr;
+                    }
+                }
+
+                Console.WriteLine($"[FLAG] No flag found using any strategy");
+                return "";
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[FLAG] Error extracting flag: {ex.Message}");
+                return "";
+            }
+        }
+
+        // ─ Global flag search (fallback) ─
+        private async Task<string> ExtractLeagueFlagImageGlobal(IPage page)
+        {
+            try
+            {
+                // Try to find any flag image on the page
+                var flagImg = await page.QuerySelectorAsync("img[class*='wcl-flag']");
+                if (flagImg != null)
+                {
+                    var srcAttr = await flagImg.GetAttributeAsync("src");
+                    if (!string.IsNullOrEmpty(srcAttr))
+                    {
+                        Console.WriteLine($"[FLAG] Global fallback: Found");
+                        return srcAttr;
+                    }
+                }
+
+                return "";
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[FLAG] Error in global search: {ex.Message}");
+                return "";
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Scraping Cache Management
+        // ═══════════════════════════════════════════════════════════════
+        private void ClearExpiredCacheEntries()
+        {
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var expiredKeys = _scrapingCache
+                .Where(kvp => kvp.Value.ExpiresAtMs < nowMs)
+                .Select(kvp => kvp.Key)
+                .ToList();
+
+            foreach (var key in expiredKeys)
+            {
+                if (_scrapingCache.TryRemove(key, out var removed))
+                {
+                    Console.WriteLine($"[CACHE] Removed expired entry: {key}");
+                }
+            }
+
+            if (expiredKeys.Count > 0)
+            {
+                Console.WriteLine($"[CACHE] Cleaned {expiredKeys.Count} expired entries. Remaining: {_scrapingCache.Count}");
+            }
+        }
+
+        private void PrintCacheStatistics()
+        {
+            long totalRequests = _cacheStatsHits + _cacheStatsMisses;
+            double hitRate = totalRequests > 0 ? (_cacheStatsHits * 100.0) / totalRequests : 0;
+
+            Console.WriteLine($"[CACHE] ═══════════════════════════════════════");
+            Console.WriteLine($"[CACHE] Cache Statistics:");
+            Console.WriteLine($"[CACHE]   Total Hits:    {_cacheStatsHits}");
+            Console.WriteLine($"[CACHE]   Total Misses:  {_cacheStatsMisses}");
+            Console.WriteLine($"[CACHE]   Hit Rate:      {hitRate:F1}%");
+            Console.WriteLine($"[CACHE]   Cached Items:  {_scrapingCache.Count}");
+            Console.WriteLine($"[CACHE] ═══════════════════════════════════════");
+        }
+
+        public void ClearScrapingCache()
+        {
+            _scrapingCache.Clear();
+            _cacheStatsHits = 0;
+            _cacheStatsMisses = 0;
+            Console.WriteLine($"[CACHE] Cache cleared completely");
+        }
+
+        private void InvalidateCacheForMatch(string matchId)
+        {
+            if (_scrapingCache.TryRemove(matchId, out _))
+            {
+                Console.WriteLine($"[CACHE] Invalidated cache for {matchId}");
+            }
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -614,9 +853,29 @@ namespace FlashscoreOverlay
                 using (var headerBrush = new SolidBrush(BgHeader))
                     g.FillRectangle(headerBrush, headerRect);
 
+                Image flagImage = null;
 
                 // League text
                 var firstMatch = group.First();
+                // Opción 1: Si tienes la imagen en base64 (desde el scraping)
+                if (!string.IsNullOrEmpty(firstMatch.LeagueImgSrc))
+                {
+                    var base64Data = firstMatch.LeagueImgSrc.Replace("data:image/png;base64,", "");
+                    byte[] imageBytes = Convert.FromBase64String(base64Data);
+                    using var ms = new MemoryStream(imageBytes);
+                    flagImage = Image.FromStream(ms);
+                }
+                // Dibujar la bandera si existe
+                int flagSize = 16; // Tamaño de la bandera
+                int flagX = PADDING_H + 5;
+                int flagY = y + (HEADER_HEIGHT - flagSize) / 2; // Centrar verticalmente
+
+                if (flagImage != null)
+                {
+                    // Dibujar imagen redimensionada
+                    g.DrawImage(flagImage, flagX, flagY, flagSize, flagSize);
+                    flagImage.Dispose(); // Liberar si no la necesitas más
+                }
                 string leagueText = $"{firstMatch.LeagueCountry}: {firstMatch.League}";
                 float leagueX = PADDING_H + 24;
                 using var headerSf = new StringFormat { FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter };
@@ -659,36 +918,32 @@ namespace FlashscoreOverlay
                     if (isLive && timeText.Any(char.IsDigit) && !timeText.Contains(':'))
                     {
                         // Draw minute + blinking apostrophe
-                        timeText = timeText.Replace("'","").Split(" ")[2];
+                        timeText = timeText.Replace("'","");
                         Console.WriteLine($"[MARC] timeText = {timeText}");
 
                         var timeSize = g.MeasureString(timeText, timeFont);
+                        float apoWidth = _blinkOn ? g.MeasureString("'", timeFont).Width : 0;
+                        float totalTimeWidth = timeSize.Width + apoWidth;
+
+                        // Center time text within available space
+                        float timeX = cx + (TIME_COL_W - totalTimeWidth) / 2;
                         float timeY = y + MATCH_ROW_HEIGHT / 2 - timeSize.Height / 2;
-                        g.DrawString(timeText, timeFont, new SolidBrush(timeColor), cx, timeY);
+
+                        g.DrawString(timeText, timeFont, new SolidBrush(timeColor), timeX, timeY);
 
                         if (_blinkOn)
                         {
-                            g.DrawString("'", timeFont, new SolidBrush(timeColor), cx + timeSize.Width - 2, timeY);
+                            g.DrawString("'", timeFont, new SolidBrush(timeColor), timeX + timeSize.Width - 2, timeY);
                         }
                     }
                     else
                     {
-                        string tmp = "";
-                        try
-                        {
-                            tmp = timeText.Split(' ')[1];
-                        }
-                        catch
-                        {
-                            tmp = timeText;
-                        }
-                        finally
-                        {
-                            timeText = tmp;
-                        }
-                        var sf = new StringFormat { LineAlignment = StringAlignment.Center };
-                        var timeRect = new RectangleF(cx, y, TIME_COL_W, MATCH_ROW_HEIGHT);
-                        g.DrawString(timeText, timeFont, new SolidBrush(timeColor), timeRect, sf);
+                        // Measure actual text size and center it
+                        var timeSize = g.MeasureString(timeText, timeFont);
+                        float timeX = cx + (TIME_COL_W - timeSize.Width) / 2;
+                        float timeY = y + MATCH_ROW_HEIGHT / 2 - timeSize.Height / 2;
+
+                        g.DrawString(timeText, timeFont, new SolidBrush(timeColor), timeX, timeY);
                     }
 
                     // Stage flash background

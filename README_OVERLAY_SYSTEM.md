@@ -92,6 +92,20 @@ ScrapeAllMatches()
 - **C# async/await**: Ejecución no-bloqueante
 - **Selectores CSS**: Targeting directo a elementos del DOM
 
+### Nota Importante: Debug vs Release
+
+⚠️ **Diferencia de Comportamiento**:
+- En modo **Debug**: Más tiempo de espera = DOM completamente renderizado
+- En modo **Release**: Ejecución más rápida = Posibles atributos dinámicos no cargados
+
+**Solución implementada**: Sistema de **4 estrategias de extracción** en cascada
+- Strategy 1: `src` directo
+- Strategy 2: `data-src` (lazy loading)
+- Strategy 3: CSS `background-image`
+- Strategy 4: Búsqueda por clase `wcl-flag`
+
+Ver `FIX_DEBUG_RELEASE_FLAGS.md` para más detalles.
+
 ### Inicio de Playwright
 
 ```csharp
