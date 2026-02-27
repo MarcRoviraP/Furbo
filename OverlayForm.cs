@@ -188,10 +188,13 @@ namespace FlashscoreOverlay
             // Start WebSocket server
             StartWebSocketServer();
 
-            // Initialize Playwright + start scrape timer
+            // Initialize Playwright, then start the scrape timer once the browser is ready.
             Console.WriteLine("[PLAYWRIGHT] Initializing...");
-            _ = InitPlaywrightAsync();
-            _scrapeTimer = new System.Threading.Timer(async _ => await ScrapeAllMatches(), null, 3000, 10000);
+            _ = InitPlaywrightAsync().ContinueWith(_ =>
+            {
+                Console.WriteLine("[PLAYWRIGHT] Starting scrape timer now that browser is ready.");
+                _scrapeTimer = new System.Threading.Timer(async _ => await ScrapeAllMatches(), null, 0, 10000);
+            });
         }
 
         // ═══════════════════════════════════════════════════════════════
@@ -278,7 +281,20 @@ namespace FlashscoreOverlay
         // ═══════════════════════════════════════════════════════════════
         private async Task ScrapeAllMatches()
         {
-            if (_browser == null) { Console.WriteLine("[SCRAPE] Skipping — browser not ready"); return; }
+            // Wait up to 10 s for the browser to finish initialising (relevant when a
+            // WebSocket sync message arrives before Playwright has fully launched).
+            if (_browser == null)
+            {
+                Console.WriteLine("[SCRAPE] Browser not ready yet — waiting up to 10 s...");
+                int waited = 0;
+                while (_browser == null && waited < 10000)
+                {
+                    await Task.Delay(500);
+                    waited += 500;
+                }
+                if (_browser == null) { Console.WriteLine("[SCRAPE] Skipping — browser still not ready after 10 s"); return; }
+                Console.WriteLine("[SCRAPE] Browser became ready after {0} ms", waited);
+            }
             if (_isScraping) { Console.WriteLine("[SCRAPE] Skipping — already scraping"); return; }
             _isScraping = true;
 
@@ -998,7 +1014,7 @@ namespace FlashscoreOverlay
             List<MatchData> snapshot;
             lock (_matchLock) { snapshot = _matches.ToList(); }
 
-            Console.WriteLine($"[PAINT] snapshot.Count = {snapshot.Count}, FormSize = {this.Width}x{this.Height}");
+            //Console.WriteLine($"[PAINT] snapshot.Count = {snapshot.Count}, FormSize = {this.Width}x{this.Height}");
             if (snapshot.Count == 0)
             {
                 // "Selecciona partidos" placeholder
